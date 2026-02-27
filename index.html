@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Smart Goggles – Auto Start</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <!-- TensorFlow for obstacle detection -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  <!-- Leaflet for map display (optional but helpful for debugging) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <style>
+    body {
+      background: black;
+      color: white;
+      text-align: center;
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+    }
+    .container {
+      position: relative;
+      display: inline-block;
+      margin-top: 10px;
+    }
+    video, canvas {
+      border: 2px solid cyan;
+      display: block;
+      background: black;
+      max-width: 100%;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      cursor: pointer;
+      background: #222;
+      color: cyan;
+      border: 1px solid cyan;
+      border-radius: 4px;
+      font-weight: bold;
+      font-size: 16px;
+    }
+    #status {
+      margin: 10px 0;
+      min-height: 24px;
+      font-size: 18px;
+      background: #111;
+      padding: 8px;
+      border-radius: 8px;
+    }
+    #map {
+      height: 200px;
+      width: 100%;
+      max-width: 600px;
+      margin: 10px auto;
+      border: 2px solid cyan;
+      border-radius: 8px;
+      display: none; /* Hidden by default, can be shown for sighted helpers */
+    }
+    .hint {
+      color: #aaa;
+      font-size: 14px;
+      margin-top: 5px;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>🕶️ Smart Goggles (Auto‑Start)</h2>
+  <p id="status">Loading AI model...</p>
+
+  <div>
+    <button id="cmdBtn">🎤 Command</button>
+    <button id="startBtn">▶ Start</button>
+    <button id="stopBtn" disabled>⏹ Stop</button>
+  </div>
+  <div class="hint" id="permissionHint"></div>
+
+  <div class="container">
+    <video id="video" width="320" height="240" playsinline></video>
+    <canvas id="canvas" width="320" height="240"></canvas>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    // ======================= CONFIGURATION =======================
+    const OPENWEATHER_API_KEY = 'YOUR_OPENWEATHER_API_KEY';     // <-- Replace with your key
+    const OPENROUTESERVICE_KEY = 'YOUR_OPENROUTESERVICE_API_KEY'; // <-- Replace with your key
+    // ==============================================================
+
+    // Global state
+    let model = null;
+    let stream = null;
+    let running = false;
+    let lastDirection = "";
+    let detectTimeout = null;
+    const speech = window.speechSynthesis;
+
+    // Navigation state
+    let currentPosition = null;          // { lat, lng }
+    let currentHeading = 0;              // degrees, 0 = north
+    let destination = null;              // { lat, lng }
+    let route = null;                    // array of [lat, lng] waypoints
+    let map = null;
+    let marker = null;
+    let polyline = null;
+
+    // ======================= SPEECH OUTPUT =======================
+    function speak(text) {
+      console.log('SPEAK:', text);
+      document.getElementById('status').innerText = text;
+      if (speech.speaking) speech.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      utterance.volume = 0.9;
+      speech.speak(utterance);
+    }
+
+    // ======================= VOICE COMMAND (INPUT) =======================
+    function listenForCommand() {
+      const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+      recognition.lang = 'en-US';
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+
+      speak('Listening for command...');
+      recognition.start();
+
+      recognition.onresult = (event) => {
+        const command = event.results[0][0].transcript.toLowerCase();
+        console.log('Command:', command);
+        processVoiceCommand(command);
+      };
+      recognition.onerror = (e) => {
+        console.error('Speech recognition error', e);
+        speak('Sorry, I did not understand.');
+      };
+      recognition.onspeechend = () => recognition.stop();
+    }
+
+    function processVoiceCommand(cmd) {
+      if (cmd.includes('where am i')) {
+        announceLocation();
+      } else if (cmd.includes('weather')) {
+        fetchWeather();
+      } else if (cmd.includes('navigate to')) {
+        let destName = cmd.replace('navigate to', '').trim();
+        if (destName === '') destName = 'Times Square';
+        geocodeDestination(destName);
+      } else if (cmd.includes('stop navigation')) {
+        stopNavigation();
+      } else {
+        speak('Command not recognized. Try "where am I", "weather", or "navigate to ...".');
+      }
+    }
+
+    // ======================= GPS & LOCATION =======================
+    function initGPS() {
+      if (!navigator.geolocation) {
+        speak('Geolocation not supported.');
+        return;
+      }
+      navigator.geolocation.watchPosition(
+        (pos) => {
+          const { latitude, longitude, heading } = pos.coords;
+          currentPosition = { lat: latitude, lng: longitude };
+          if (heading !== null && !isNaN(heading)) {
+            currentHeading = heading;
+          }
+          updateMap();
+          if (destination && route) {
+            giveNavigationInstruction();
+          }
+        },
+        (err) => {
+          console.error('GPS error:', err);
+          speak('Cannot get GPS location.');
+        },
+        { enableHighAccuracy: true, maximumAge: 1000 }
+      );
+    }
+
+    // ======================= MAP (LEAFLET) =======================
+    function initMap() {
+      if (!map) {
+        map = L.map('map').setView([0, 0], 15);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© OpenStreetMap'
+        }).addTo(map);
+        document.getElementById('map').style.display = 'block';
+      }
+    }
+
+    function updateMap() {
+      if (!currentPosition) return;
+      initMap();
+      if (marker) marker.remove();
+      marker = L.marker([currentPosition.lat, currentPosition.lng]).addTo(map);
+      map.panTo([currentPosition.lat, currentPosition.lng]);
+
+      if (polyline) polyline.remove();
+      if (route) {
+        polyline = L.polyline(route, { color: 'blue' }).addTo(map);
+      }
+    }
+
+    // ======================= NAVIGATION =======================
+    function geocodeDestination(name) {
+      speak(`Searching for ${name}.`);
+      // Use Nominatim (free, no key required for limited use)
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(name)}`;
+      fetch(url)
+        .then(r => r.json())
+        .then(data => {
+          if (data.length > 0) {
+            const { lat, lon, display_name } = data[0];
+            destination = { lat: parseFloat(lat), lng: parseFloat(lon) };
+            speak(`Destination set to ${display_name.split(',')[0]}.`);
+            fetchRoute();
+          } else {
+            speak('Place not found.');
+          }
+        })
+        .catch(() => speak('Geocoding service error.'));
+    }
+
+    function fetchRoute() {
+      if (!currentPosition || !destination) return;
+      const start = `${currentPosition.lng},${currentPosition.lat}`;
+      const end = `${destination.lng},${destination.lat}`;
+      const url = `https://api.openrouteservice.org/v2/directions/foot-walking?api_key=${OPENROUTESERVICE_KEY}&start=${start}&end=${end}`;
+
+      fetch(url)
+        .then(res => res.json())
+        .then(data => {
+          if (data.features && data.features.length > 0) {
+            const coords = data.features[0].geometry.coordinates.map(c => [c[1], c[0]]);
+            route = coords;
+            updateMap();
+            speak('Route found. Starting navigation.');
+          } else {
+            speak('Could not find a route.');
+          }
+        })
+        .catch(err => {
+          console.error('Routing error:', err);
+          speak('Routing service unavailable.');
+        });
+    }
+
+    function giveNavigationInstruction() {
+      if (!route || route.length < 2 || !currentPosition) return;
+
+      // Find the closest point on route to current location
+      let minDist = Infinity;
+      let closestIdx = 0;
+      for (let i = 0; i < route.length; i++) {
+        const dist = getDistance(currentPosition, { lat: route[i][0], lng: route[i][1] });
+        if (dist < minDist) {
+          minDist = dist;
+          closestIdx = i;
+        }
+      }
+
+      // If we are near the end
+      if (closestIdx >= route.length - 1) {
+        speak('You have arrived at your destination.');
+        stopNavigation();
+        return;
+      }
+
+      // Next point on route
+      const nextPoint = { lat: route[closestIdx + 1][0], lng: route[closestIdx + 1][1] };
+      const bearing = calculateBearing(currentPosition, nextPoint);
+      const instruction = getDirectionDescription(bearing, currentHeading);
+      speak(instruction);
+    }
+
+    function getDistance(p1, p2) {
+      const R = 6371e3; // metres
+      const φ1 = p1.lat * Math.PI/180;
+      const φ2 = p2.lat * Math.PI/180;
+      const Δφ = (p2.lat - p1.lat) * Math.PI/180;
+      const Δλ = (p2.lng - p1.lng) * Math.PI/180;
+
+      const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ/2) * Math.sin(Δλ/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    function calculateBearing(start, end) {
+      const lat1 = start.lat * Math.PI/180;
+      const lat2 = end.lat * Math.PI/180;
+      const deltaLng = (end.lng - start.lng) * Math.PI/180;
+      const y = Math.sin(deltaLng) * Math.cos(lat2);
+      const x = Math.cos(lat1) * Math.sin(lat2) -
+                Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLng);
+      const bearing = Math.atan2(y, x) * 180/Math.PI;
+      return (bearing + 360) % 360;
+    }
+
+    function getDirectionDescription(bearing, heading) {
+      const diff = (bearing - heading + 360) % 360;
+      if (diff < 30) return 'Continue straight.';
+      if (diff < 75) return 'Turn slightly right.';
+      if (diff < 120) return 'Turn right.';
+      if (diff < 165) return 'Turn sharply right.';
+      if (diff < 195) return 'Turn around.';
+      if (diff < 240) return 'Turn sharply left.';
+      if (diff < 285) return 'Turn left.';
+      if (diff < 330) return 'Turn slightly left.';
+      return 'Continue straight.';
+    }
+
+    function stopNavigation() {
+      destination = null;
+      route = null;
+      if (polyline) polyline.remove();
+      polyline = null;
+      speak('Navigation stopped.');
+    }
+
+    // ======================= WEATHER =======================
+    function fetchWeather() {
+      if (!currentPosition) {
+        speak('Location unknown for weather.');
+        return;
+      }
+      const { lat, lng } = currentPosition;
+      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+
+      fetch(url)
+        .then(res => res.json())
+        .then(data => {
+          const desc = data.weather[0].description;
+          const temp = data.main.temp;
+          speak(`Current weather: ${desc}, temperature ${temp} degrees Celsius.`);
+        })
+        .catch(err => {
+          console.error('Weather error:', err);
+          speak('Weather service unavailable.');
+        });
+    }
+
+    function announceLocation() {
+      if (!currentPosition) {
+        speak('Location unknown.');
+        return;
+      }
+      speak(`You are at latitude ${currentPosition.lat.toFixed(4)}, longitude ${currentPosition.lng.toFixed(4)}.`);
+    }
+
+    // ======================= OBSTACLE DETECTION =======================
+    async function loadAI() {
+      try {
+        model = await cocoSsd.load();
+        document.getElementById("status").innerText = "AI Ready ✅";
+        document.getElementById("startBtn").disabled = false;
+        // Attempt to auto-start camera
+        autoStartCamera();
+      } catch (error) {
+        console.error("Model loading failed:", error);
+        document.getElementById("status").innerText = "AI Failed to Load ❌";
+      }
+    }
+
+    async function autoStartCamera() {
+      try {
+        await start();  // will request camera
+      } catch (err) {
+        // start() already handles errors and re-enables the Start button
+        console.log('Auto-start failed, waiting for user gesture.');
+      }
+    }
+
+    async function start() {
+      if (running || !model) return;
+      
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: "environment" } 
+        });
+        
+        const video = document.getElementById("video");
+        video.srcObject = stream;
+        
+        await new Promise((resolve) => {
+          video.onloadedmetadata = resolve;
+        });
+        
+        await video.play();
+        running = true;
+        document.getElementById("stopBtn").disabled = false;
+        document.getElementById("startBtn").disabled = true;
+        document.getElementById("permissionHint").innerText = "";
+        
+        // Start GPS
+        initGPS();
+        
+        // Start detection loop
+        detect();
+      } catch (error) {
+        console.error("Camera error:", error);
+        document.getElementById("status").innerText = "Camera access failed. Tap Start to try again.";
+        document.getElementById("permissionHint").innerText = "Browser may require a tap to start camera.";
+        // Re-enable start button for manual retry
+        document.getElementById("startBtn").disabled = false;
+      }
+    }
+
+    function stop() {
+      if (detectTimeout) {
+        clearTimeout(detectTimeout);
+        detectTimeout = null;
+      }
+      
+      running = false;
+      lastDirection = "";
+      
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      
+      speech.cancel();
+      document.getElementById("status").innerText = "System Stopped";
+      document.getElementById("stopBtn").disabled = true;
+      document.getElementById("startBtn").disabled = false;
+      
+      // Clear canvas
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    async function detect() {
+      if (!running) return;
+      
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+      
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        const predictions = await model.detect(video);
+        
+        if (predictions.length > 0) {
+          // Find closest object (largest area)
+          const closest = predictions.reduce((prev, curr) => 
+            (curr.bbox[2] * curr.bbox[3] > prev.bbox[2] * prev.bbox[3]) ? curr : prev
+          );
+          
+          const [x, y, w, h] = closest.bbox;
+          const centerX = x + w / 2;
+          
+          // Determine direction
+          let direction = "";
+          if (centerX < canvas.width * 0.33) {
+            direction = "left";
+          } else if (centerX > canvas.width * 0.66) {
+            direction = "right";
+          } else {
+            direction = "ahead";
+          }
+          
+          // Draw detection
+          ctx.strokeStyle = "red";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x, y, w, h);
+          ctx.fillStyle = "red";
+          ctx.font = "12px Arial";
+          ctx.fillText(`${closest.class} (${Math.round(closest.score * 100)}%)`, x, y > 20 ? y - 5 : y + 15);
+          
+          // Update status and speak (only if direction changes)
+          const message = `Obstacle ${direction}: ${closest.class}`;
+          if (direction !== lastDirection) {
+            speak(message);
+            lastDirection = direction;
+          }
+          document.getElementById("status").innerText = message;
+        } else {
+          document.getElementById("status").innerText = "Path clear";
+          lastDirection = ""; // reset so next obstacle triggers speech
+        }
+      } catch (error) {
+        console.error("Detection error:", error);
+        document.getElementById("status").innerText = "Detection error";
+      }
+      
+      detectTimeout = setTimeout(detect, 500);
+    }
+
+    // ======================= INIT =======================
+    window.onload = () => {
+      document.getElementById("cmdBtn").addEventListener("click", listenForCommand);
+      document.getElementById("startBtn").addEventListener("click", start);
+      document.getElementById("stopBtn").addEventListener("click", stop);
+      
+      loadAI();  // will auto-start camera when model is ready
+    };
+  </script>
+</body>
+</html>
